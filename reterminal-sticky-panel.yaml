@@ -1,0 +1,836 @@
+# =============================================================================
+# reTerminal Sticky — Home Assistant touch panel for lights + fan (ESPHome)
+# -----------------------------------------------------------------------------
+# - 3 rooms, 4 lights + 1 fan each. Tap a tile to toggle, swipe left/right
+#   (or UP/DOWN buttons) to change room, OK = everything in this room off.
+# - Portrait ePaper UI with Material Design Icons (same icons as Home Assistant).
+# - On battery: sleeps after inactivity, wakes when picked up (IMU) or OK pressed.
+#
+# Setup:
+#   1. Copy secrets.example.yaml to secrets.yaml and fill it in.
+#   2. Change the entity IDs and names under `substitutions` to yours.
+#   3. In Home Assistant: Settings > Devices & services > ESPHome > this device
+#      > Configure > enable "Allow the device to perform Home Assistant actions".
+#   4. Before wireless updates, switch on "Stay Awake" (or plug in USB).
+# =============================================================================
+
+substitutions:
+  device_name: reterminal-sticky
+  friendly_name: "reTerminal Sticky"
+  awake_seconds: "45"        # on battery: sleep after this many idle seconds
+
+  # ---- Room names shown on screen ----
+  room1: "Room 1"
+  room2: "Room 2"
+  room3: "Room 3"
+
+  # ---- Light entity IDs (Developer Tools > States in Home Assistant) ----
+  r1_l1: light.room1_light1
+  r1_l2: light.room1_light2
+  r1_l3: light.room1_light3
+  r1_l4: light.room1_light4
+  r2_l1: light.room2_light1
+  r2_l2: light.room2_light2
+  r2_l3: light.room2_light3
+  r2_l4: light.room2_light4
+  r3_l1: light.room3_light1
+  r3_l2: light.room3_light2
+  r3_l3: light.room3_light3
+  r3_l4: light.room3_light4
+
+  # ---- Fan entity IDs ----
+  r1_fan: fan.room1_fan
+  r2_fan: fan.room2_fan
+  r3_fan: fan.room3_fan
+
+  # ---- Room temperature / humidity shown in the header ----
+  r1_temp: sensor.room1_temperature
+  r1_hum: sensor.room1_humidity
+  r2_temp: sensor.room2_temperature
+  r2_hum: sensor.room2_humidity
+  r3_temp: sensor.room3_temperature
+  r3_hum: sensor.room3_humidity
+
+  # ---- Names printed on the tiles (keep them short, ~10 characters) ----
+  r1_n1: "Light 1"
+  r1_n2: "Light 2"
+  r1_n3: "Light 3"
+  r1_n4: "Light 4"
+  r2_n1: "Light 1"
+  r2_n2: "Light 2"
+  r2_n3: "Light 3"
+  r2_n4: "Light 4"
+  r3_n1: "Light 1"
+  r3_n2: "Light 2"
+  r3_n3: "Light 3"
+  r3_n4: "Light 4"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    - priority: 600
+      then:
+        # GPIO45/46 hold the power latch: must be HIGH or the device switches off
+        - output.turn_on: pwr_hold
+        - output.turn_on: pwr_lock
+        # Release the pin hold that kept them HIGH during deep sleep
+        - lambda: |-
+            gpio_hold_dis(GPIO_NUM_45);
+            gpio_hold_dis(GPIO_NUM_46);
+            id(last_activity) = millis();
+        # BQ25616 charge enable is active-LOW: without this the battery never charges
+        - output.turn_on: charge_enable
+        - switch.turn_on: touch_power_enable
+        - pcf8563.read_time:
+        # Mic and SD card are not used: keep them unpowered to save battery
+        - output.turn_off: mic_power_enable
+        - output.turn_off: sd_power_enable
+    - priority: -100
+      then:
+        # LSM6DS3TR-C (0x6A): pull INT (GPIO7) LOW on movement = wake-on-motion
+        # Register recipe from ST application note AN5130.
+        - lambda: |-
+            auto w = [](uint8_t reg, uint8_t val) {
+              uint8_t b[2] = {reg, val};
+              id(i2c_sensor).write_readv(0x6A, b, 2, nullptr, 0);
+            };
+            w(0x10, 0x20);   // CTRL1_XL: accel 26 Hz, +-2 g
+            w(0x12, 0x24);   // CTRL3_C: INT active-LOW, register auto-increment
+            w(0x58, 0x90);   // TAP_CFG: enable interrupts, slope filter
+            w(0x5C, 0x00);   // WAKE_UP_DUR: react on first sample
+            w(0x5B, 0x03);   // WAKE_UP_THS: ~94 mg = a pick-up or a firm tap
+            w(0x5E, 0x20);   // MD1_CFG: wake-up -> INT1
+            w(0x5F, 0x20);   // MD2_CFG: wake-up -> INT2
+            ESP_LOGI("imu", "Wake-on-motion armed");
+        - script.execute: refresh_soon
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: ESP32S3
+  flash_size: 32MB
+  framework:
+    type: arduino
+    advanced:
+      enable_idf_experimental_features: true
+
+# Serial logs go out on UART0 (CH343P USB bridge)
+logger:
+  hardware_uart: UART0
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true         # skip the scan on wake: connects ~2 s sooner
+  power_save_mode: none      # fastest response; battery is handled by deep sleep
+  ap:
+    ssid: "reTerminal-Sticky"
+    password: !secret ap_password
+
+captive_portal:
+
+# =============================================================================
+# Fonts and icons
+# =============================================================================
+font:
+  - file: "gfonts://Inter@700"
+    id: font_title
+    size: 36
+  - file: "gfonts://Inter@700"
+    id: font_name
+    size: 28
+  - file: "gfonts://Inter@400"
+    id: font_reg
+    size: 22
+
+  # Material Design Icons (pictogrammers.com), the icon set Home Assistant uses
+  - file:
+      type: web
+      url: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_xl
+    size: 84
+    glyphs:
+      - "\U000F06E8"   # lightbulb-on
+      - "\U000F0336"   # lightbulb-outline
+  - file:
+      type: web
+      url: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_l
+    size: 56
+    glyphs:
+      - "\U000F0210"   # fan
+      - "\U000F081D"   # fan-off
+      - "\U000F0374"   # minus
+      - "\U000F0415"   # plus
+  - file:
+      type: web
+      url: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_s
+    size: 28
+    glyphs:
+      - "\U000F050F"   # thermometer
+      - "\U000F058E"   # water-percent
+      - "\U000F04B2"   # sleep
+      - "\U000F0084"   # battery-charging
+      - "\U000F0079"   # battery (full)
+      - "\U000F0082"   # battery-90
+      - "\U000F0080"   # battery-70
+      - "\U000F007E"   # battery-50
+      - "\U000F007C"   # battery-30
+      - "\U000F007A"   # battery-10
+      - "\U000F008E"   # battery-outline (empty)
+
+# =============================================================================
+# Buses
+# =============================================================================
+spi:
+  clk_pin: GPIO13
+  mosi_pin: GPIO14
+  miso_pin: GPIO12
+
+i2c:
+  # SHT40, PCF8563 RTC, BQ27220 fuel gauge, LSM6DS3TR-C IMU
+  - id: i2c_sensor
+    scl: GPIO0
+    sda: GPIO1
+    frequency: 400kHz
+  # GT911 touch
+  - id: i2c_touch
+    scl: GPIO2
+    sda: GPIO3
+    frequency: 100kHz
+
+# =============================================================================
+# Power, buzzer
+# =============================================================================
+output:
+  - platform: gpio
+    pin: GPIO45
+    id: pwr_hold
+  - platform: gpio
+    pin: GPIO46
+    id: pwr_lock
+  - platform: ledc
+    pin: GPIO48
+    id: buzzer_pwm
+    frequency: 1000Hz
+  - platform: gpio
+    pin: GPIO38
+    id: mic_power_enable
+  - platform: gpio            # BQ25616 charge enable, active LOW
+    pin:
+      number: GPIO39
+      inverted: true
+    id: charge_enable
+  - platform: gpio
+    pin: GPIO10
+    id: sd_power_enable
+
+light:
+  - platform: monochromatic
+    output: buzzer_pwm
+    name: "Buzzer"
+    id: buzzer
+    default_transition_length: 0s
+
+switch:
+  # Turn on in Home Assistant before a wireless update so the Sticky doesn't sleep
+  - platform: template
+    id: stay_awake
+    name: "Stay Awake"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: gpio
+    pin: GPIO42
+    id: touch_power_enable
+    internal: true
+    restore_mode: ALWAYS_ON
+    setup_priority: 1100
+
+time:
+  - platform: pcf8563
+    i2c_id: i2c_sensor
+    id: rtc_time
+    address: 0x51
+    update_interval: never
+  - platform: homeassistant
+    on_time_sync:
+      then:
+        - pcf8563.write_time:
+
+# =============================================================================
+# Sensors
+# =============================================================================
+sensor:
+  - platform: sht4x
+    i2c_id: i2c_sensor
+    address: 0x44
+    temperature:
+      name: "Temperature"
+      id: temp_sensor
+    humidity:
+      name: "Relative Humidity"
+      id: hum_sensor
+    update_interval: 60s
+
+  # BQ27220 fuel gauge (I2C 0x55), read directly
+  - platform: template
+    id: battery_level
+    name: "Battery Level"
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      uint8_t reg = 0x2C;
+      uint8_t raw[2] = {0, 0};
+      if (id(i2c_sensor).write_readv(0x55, &reg, 1, raw, 2) != esphome::i2c::ERROR_OK) return NAN;
+      return static_cast<float>(raw[0] | (raw[1] << 8));
+
+  - platform: template
+    id: battery_voltage
+    name: "Battery Voltage"
+    unit_of_measurement: "mV"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      uint8_t reg = 0x08;
+      uint8_t raw[2] = {0, 0};
+      if (id(i2c_sensor).write_readv(0x55, &reg, 1, raw, 2) != esphome::i2c::ERROR_OK) return NAN;
+      return static_cast<float>(raw[0] | (raw[1] << 8));
+
+  - platform: template
+    id: battery_current
+    name: "Battery Current"
+    unit_of_measurement: "mA"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      uint8_t reg = 0x0C;
+      uint8_t raw[2] = {0, 0};
+      if (id(i2c_sensor).write_readv(0x55, &reg, 1, raw, 2) != esphome::i2c::ERROR_OK) return NAN;
+      return static_cast<float>(static_cast<int16_t>(raw[0] | (raw[1] << 8)));
+
+  # Room climate from Home Assistant (header)
+  - platform: homeassistant
+    id: rt_1
+    entity_id: ${r1_temp}
+  - platform: homeassistant
+    id: rh_1
+    entity_id: ${r1_hum}
+  - platform: homeassistant
+    id: rt_2
+    entity_id: ${r2_temp}
+  - platform: homeassistant
+    id: rh_2
+    entity_id: ${r2_hum}
+  - platform: homeassistant
+    id: rt_3
+    entity_id: ${r3_temp}
+  - platform: homeassistant
+    id: rh_3
+    entity_id: ${r3_hum}
+
+  # Fan speed % from Home Assistant
+  - platform: homeassistant
+    id: fan_pct_1
+    entity_id: ${r1_fan}
+    attribute: percentage
+    on_value:
+      then:
+        - script.execute: refresh_soon
+  - platform: homeassistant
+    id: fan_pct_2
+    entity_id: ${r2_fan}
+    attribute: percentage
+    on_value:
+      then:
+        - script.execute: refresh_soon
+  - platform: homeassistant
+    id: fan_pct_3
+    entity_id: ${r3_fan}
+    attribute: percentage
+    on_value:
+      then:
+        - script.execute: refresh_soon
+
+text_sensor:
+  # Light and fan states from Home Assistant
+  - platform: homeassistant
+    id: l1_1
+    entity_id: ${r1_l1}
+    on_value: { then: [ script.execute: refresh_soon ] }
+  - platform: homeassistant
+    id: l1_2
+    entity_id: ${r1_l2}
+    on_value: { then: [ script.execute: refresh_soon ] }
+  - platform: homeassistant
+    id: l1_3
+    entity_id: ${r1_l3}
+    on_value: { then: [ script.execute: refresh_soon ] }
+  - platform: homeassistant
+    id: l1_4
+    entity_id: ${r1_l4}
+    on_value: { then: [ script.execute: refresh_soon ] }
+  - platform: homeassistant
+    id: l2_1
+    entity_id: ${r2_l1}
+    on_value: { then: [ script.execute: refresh_soon ] }
+  - platform: homeassistant
+    id: l2_2
+    entity_id: ${r2_l2}
+    on_value: { then: [ script.execute: refresh_soon ] }
+  - platform: homeassistant
+    id: l2_3
+    entity_id: ${r2_l3}
+    on_value: { then: [ script.execute: refresh_soon ] }
+  - platform: homeassistant
+    id: l2_4
+    entity_id: ${r2_l4}
+    on_value: { then: [ script.execute: refresh_soon ] }
+  - platform: homeassistant
+    id: l3_1
+    entity_id: ${r3_l1}
+    on_value: { then: [ script.execute: refresh_soon ] }
+  - platform: homeassistant
+    id: l3_2
+    entity_id: ${r3_l2}
+    on_value: { then: [ script.execute: refresh_soon ] }
+  - platform: homeassistant
+    id: l3_3
+    entity_id: ${r3_l3}
+    on_value: { then: [ script.execute: refresh_soon ] }
+  - platform: homeassistant
+    id: l3_4
+    entity_id: ${r3_l4}
+    on_value: { then: [ script.execute: refresh_soon ] }
+  - platform: homeassistant
+    id: fan_1
+    entity_id: ${r1_fan}
+    on_value: { then: [ script.execute: refresh_soon ] }
+  - platform: homeassistant
+    id: fan_2
+    entity_id: ${r2_fan}
+    on_value: { then: [ script.execute: refresh_soon ] }
+  - platform: homeassistant
+    id: fan_3
+    entity_id: ${r3_fan}
+    on_value: { then: [ script.execute: refresh_soon ] }
+
+binary_sensor:
+  # UP = previous room
+  - platform: gpio
+    pin:
+      number: GPIO5
+      mode: INPUT_PULLUP
+      inverted: true
+    id: button_up
+    name: "Button UP"
+    on_press:
+      then:
+        - lambda: |-
+            id(last_activity) = millis();
+            id(page) = (id(page) + 2) % 3;
+        - script.execute: beep
+        - script.execute: refresh_soon
+
+  # DOWN = next room
+  - platform: gpio
+    pin:
+      number: GPIO6
+      mode: INPUT_PULLUP
+      inverted: true
+    id: button_down
+    name: "Button DOWN"
+    on_press:
+      then:
+        - lambda: |-
+            id(last_activity) = millis();
+            id(page) = (id(page) + 1) % 3;
+        - script.execute: beep
+        - script.execute: refresh_soon
+
+  # OK = everything in this room off (also a deep-sleep wake source)
+  - platform: gpio
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+      allow_other_uses: true
+    id: button_ok
+    name: "Button OK"
+    on_press:
+      then:
+        - lambda: 'id(last_activity) = millis();'
+        - script.execute: room_all_off
+
+  # IMU movement keeps the panel awake (also a deep-sleep wake source)
+  - platform: gpio
+    pin:
+      number: GPIO7
+      inverted: true
+      allow_other_uses: true
+    id: imu_motion
+    internal: true
+    on_press:
+      then:
+        - lambda: 'id(last_activity) = millis();'
+
+  # Charging if the fuel gauge reports more than 20 mA flowing in
+  - platform: template
+    id: charging
+    name: "Battery Charging"
+    lambda: |-
+      if (isnan(id(battery_current).state)) return false;
+      return id(battery_current).state > 20.0f;
+
+# =============================================================================
+# State
+# =============================================================================
+globals:
+  - id: page            # 0, 1, 2 = room 1, 2, 3
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_activity   # millis() of the last touch / button / movement
+    type: uint32_t
+    initial_value: '0'
+  - id: going_to_sleep
+    type: bool
+    initial_value: 'false'
+  - id: screen_dirty
+    type: bool
+    initial_value: 'false'
+  - id: tx0             # touch start / end, for swipe vs tap
+    type: int
+  - id: ty0
+    type: int
+  - id: tx1
+    type: int
+  - id: ty1
+    type: int
+
+script:
+  # Ask for a redraw. Changes that arrive together become one redraw.
+  - id: refresh_soon
+    mode: restart
+    then:
+      - lambda: 'id(screen_dirty) = true;'
+      - delay: 100ms
+      - if:
+          condition:
+            not:
+              script.is_running: do_refresh
+          then:
+            - script.execute: do_refresh
+
+  # One redraw at a time. The panel needs ~2 s to finish a frame;
+  # asking earlier makes it drop the request ("Display already in state ...").
+  - id: do_refresh
+    mode: single
+    then:
+      - while:
+          condition:
+            lambda: 'return id(screen_dirty);'
+          then:
+            - lambda: 'id(screen_dirty) = false;'
+            - component.update: epaper_display
+            - delay: 2500ms
+
+  # Short click, timed in one lambda so a busy redraw can't stretch it
+  - id: beep
+    mode: restart
+    then:
+      - lambda: |-
+          id(buzzer_pwm).set_level(0.5);
+          delay(40);
+          id(buzzer_pwm).set_level(0.0);
+
+  # Toggle light 0..3 of the room on screen
+  - id: toggle_tile
+    mode: queued
+    parameters:
+      tile: int
+    then:
+      - script.execute: beep
+      - homeassistant.action:
+          action: light.toggle
+          data:
+            entity_id: !lambda |-
+              static const char *ids[3][4] = {
+                {"${r1_l1}", "${r1_l2}", "${r1_l3}", "${r1_l4}"},
+                {"${r2_l1}", "${r2_l2}", "${r2_l3}", "${r2_l4}"},
+                {"${r3_l1}", "${r3_l2}", "${r3_l3}", "${r3_l4}"}};
+              return std::string(ids[id(page)][tile]);
+
+  # Fan: zone 0 = slower, 1 = on/off, 2 = faster
+  - id: fan_tap
+    mode: queued
+    parameters:
+      zone: int
+    then:
+      - script.execute: beep
+      - homeassistant.action:
+          action: !lambda |-
+            return std::string(zone == 0 ? "fan.decrease_speed"
+                             : zone == 2 ? "fan.increase_speed" : "fan.toggle");
+          data:
+            entity_id: !lambda |-
+              static const char *f[3] = {"${r1_fan}", "${r2_fan}", "${r3_fan}"};
+              return std::string(f[id(page)]);
+
+  # Everything in the room on screen off
+  - id: room_all_off
+    then:
+      - script.execute: beep
+      - homeassistant.action:
+          action: light.turn_off
+          data:
+            entity_id: !lambda |-
+              static const char *rooms[3] = {
+                "${r1_l1},${r1_l2},${r1_l3},${r1_l4}",
+                "${r2_l1},${r2_l2},${r2_l3},${r2_l4}",
+                "${r3_l1},${r3_l2},${r3_l3},${r3_l4}"};
+              return std::string(rooms[id(page)]);
+      - homeassistant.action:
+          action: fan.turn_off
+          data:
+            entity_id: !lambda |-
+              static const char *f[3] = {"${r1_fan}", "${r2_fan}", "${r3_fan}"};
+              return std::string(f[id(page)]);
+
+  # Show the sleep note (ePaper keeps the image with no power), then deep sleep
+  - id: go_sleep
+    mode: single
+    then:
+      - lambda: 'id(going_to_sleep) = true;'
+      - script.execute: refresh_soon
+      - delay: 300ms
+      - wait_until:
+          condition:
+            not:
+              script.is_running: do_refresh
+          timeout: 6s
+      - lambda: |-
+          // keep the power latch HIGH while asleep, or the Sticky switches off fully
+          gpio_hold_en(GPIO_NUM_45);
+          gpio_hold_en(GPIO_NUM_46);
+          gpio_deep_sleep_hold_en();
+      - deep_sleep.enter: deep_sleep_1
+
+# =============================================================================
+# Touch: tap = toggle, swipe left/right = change room
+# =============================================================================
+touchscreen:
+  - platform: gt911
+    i2c_id: i2c_touch
+    id: sticky_touch
+    interrupt_pin: GPIO21
+    reset_pin: GPIO41
+    on_touch:
+      - lambda: |-
+          // In portrait the touch panel's Y runs opposite to the screen: flip it
+          id(last_activity) = millis();
+          id(tx0) = touch.x; id(ty0) = 799 - touch.y;
+          id(tx1) = touch.x; id(ty1) = 799 - touch.y;
+    on_update:
+      - lambda: |-
+          for (auto t : touches) { id(tx1) = t.x; id(ty1) = 799 - t.y; }
+    on_release:
+      - lambda: |-
+          int dx = id(tx1) - id(tx0), dy = id(ty1) - id(ty0);
+
+          // Swipe: long sideways move
+          if (abs(dx) > 120 && abs(dx) > abs(dy)) {
+            id(page) = dx < 0 ? (id(page) + 1) % 3 : (id(page) + 2) % 3;
+            id(beep).execute();
+            id(refresh_soon).execute();
+            return;
+          }
+          // Moved a lot but not a clean swipe: ignore (no accidental toggles)
+          if (abs(dx) > 40 || abs(dy) > 40) return;
+
+          // Tap: act on where the finger went down (portrait 480 x 800)
+          int x = id(tx0), y = id(ty0);
+          if (y < 110) {                            // header = next room
+            id(page) = (id(page) + 1) % 3;
+            id(beep).execute();
+            id(refresh_soon).execute();
+          } else if (y < 604) {                     // light tiles 2 x 2
+            id(toggle_tile).execute((x >= 240 ? 1 : 0) + (y >= 360 ? 2 : 0));
+          } else if (y < 708) {                     // fan card = on / off
+            id(fan_tap).execute(1);
+          } else {                                  // - / + buttons
+            id(fan_tap).execute(x < 240 ? 0 : 2);
+          }
+
+# =============================================================================
+# ePaper UI (3.97", 800x480 panel, used as 480x800 portrait)
+# =============================================================================
+display:
+  - platform: epaper_spi
+    id: epaper_display
+    model: seeed-reterminal-sticky
+    rotation: 90               # portrait. Upside down? use 270
+    full_update_every: 30      # fast partial refresh; full clean-up every 30th
+    update_interval: never     # every redraw goes through do_refresh
+    lambda: |-
+      const char *rooms[3] = {"${room1}", "${room2}", "${room3}"};
+      const char *names[3][4] = {
+        {"${r1_n1}", "${r1_n2}", "${r1_n3}", "${r1_n4}"},
+        {"${r2_n1}", "${r2_n2}", "${r2_n3}", "${r2_n4}"},
+        {"${r3_n1}", "${r3_n2}", "${r3_n3}", "${r3_n4}"}};
+      text_sensor::TextSensor *st[3][4] = {
+        {id(l1_1), id(l1_2), id(l1_3), id(l1_4)},
+        {id(l2_1), id(l2_2), id(l2_3), id(l2_4)},
+        {id(l3_1), id(l3_2), id(l3_3), id(l3_4)}};
+      int p = id(page);
+      auto INK = COLOR_OFF, PAPER = COLOR_ON;
+
+      // Grid: 16 px margin, 12 px gap, 22 px corners
+      const int W = 480, H = 800, M = 16, G = 12, R = 22;
+
+      // Rounded card: solid when on, 2 px outline when off
+      auto rr = [&](int x, int y, int w, int h, int r, Color c) {
+        it.filled_rectangle(x + r, y, w - 2 * r, h, c);
+        it.filled_rectangle(x, y + r, w, h - 2 * r, c);
+        it.filled_circle(x + r, y + r, r, c);
+        it.filled_circle(x + w - r - 1, y + r, r, c);
+        it.filled_circle(x + r, y + h - r - 1, r, c);
+        it.filled_circle(x + w - r - 1, y + h - r - 1, r, c);
+      };
+      auto card = [&](int x, int y, int w, int h, bool on) {
+        rr(x, y, w, h, R, INK);
+        if (!on) rr(x + 2, y + 2, w - 4, h - 4, R - 2, PAPER);
+      };
+
+      // ---- Header: room name + page dots ----
+      it.printf(M, 42, id(font_title), INK, TextAlign::CENTER_LEFT, "%s", rooms[p]);
+      for (int i = 0; i < 3; i++) {
+        int cx = W - M - 6 - (2 - i) * 22;
+        if (i == p) it.filled_circle(cx, 42, 6, INK);
+        else { it.circle(cx, 42, 5, INK); it.circle(cx, 42, 4, INK); }
+      }
+
+      // ---- Status row: temperature, humidity, battery (or sleep note) ----
+      if (id(going_to_sleep)) {
+        it.print(M, 88, id(mdi_s), INK, TextAlign::CENTER_LEFT, "\U000F04B2");
+        it.print(M + 36, 88, id(font_reg), INK, TextAlign::CENTER_LEFT, "Sleeping - lift me or press OK");
+      } else {
+        sensor::Sensor *rt[3] = {id(rt_1), id(rt_2), id(rt_3)};
+        sensor::Sensor *rh[3] = {id(rh_1), id(rh_2), id(rh_3)};
+        it.print(M, 88, id(mdi_s), INK, TextAlign::CENTER_LEFT, "\U000F050F");
+        if (rt[p]->has_state() && !isnan(rt[p]->state))
+          it.printf(M + 30, 88, id(font_reg), INK, TextAlign::CENTER_LEFT, "%.1f°", rt[p]->state);
+        else
+          it.print(M + 30, 88, id(font_reg), INK, TextAlign::CENTER_LEFT, "--");
+        it.print(150, 88, id(mdi_s), INK, TextAlign::CENTER_LEFT, "\U000F058E");
+        if (rh[p]->has_state() && !isnan(rh[p]->state))
+          it.printf(182, 88, id(font_reg), INK, TextAlign::CENTER_LEFT, "%.0f%%", rh[p]->state);
+        else
+          it.print(182, 88, id(font_reg), INK, TextAlign::CENTER_LEFT, "--");
+        float bl = id(battery_level).state;
+        if (!isnan(bl)) {
+          const char *bi = id(charging).state ? "\U000F0084"
+                         : bl > 95 ? "\U000F0079" : bl > 80 ? "\U000F0082" : bl > 60 ? "\U000F0080"
+                         : bl > 40 ? "\U000F007E" : bl > 20 ? "\U000F007C" : bl > 5 ? "\U000F007A"
+                         : "\U000F008E";
+          it.print(W - M - 84, 88, id(mdi_s), INK, TextAlign::CENTER_LEFT, bi);
+          it.printf(W - M, 88, id(font_reg), INK, TextAlign::CENTER_RIGHT, "%.0f%%", bl);
+        }
+      }
+      it.line(M, 110, W - M, 110, INK);
+
+      // ---- Light tiles (2 x 2) ----
+      const int TW = (W - 2 * M - G) / 2;            // 218
+      const int TY = 122, TH = 232;
+      for (int t = 0; t < 4; t++) {
+        int x = M + (t % 2) * (TW + G), y = TY + (t / 2) * (TH + G);
+        auto *s = st[p][t];
+        bool on = s->has_state() && s->state == "on";
+        const char *label = !s->has_state() ? "--"
+                          : on ? "On"
+                          : (s->state == "off" ? "Off" : "Unavailable");
+        card(x, y, TW, TH, on);
+        auto fg = on ? PAPER : INK;
+        it.print(x + TW / 2, y + 88, id(mdi_xl), fg, TextAlign::CENTER, on ? "\U000F06E8" : "\U000F0336");
+        it.printf(x + TW / 2, y + 166, id(font_name), fg, TextAlign::CENTER, "%s", names[p][t]);
+        it.printf(x + TW / 2, y + 200, id(font_reg), fg, TextAlign::CENTER, "%s", label);
+      }
+
+      // ---- Fan card (tap = on/off) ----
+      text_sensor::TextSensor *fs[3] = {id(fan_1), id(fan_2), id(fan_3)};
+      sensor::Sensor *fp[3] = {id(fan_pct_1), id(fan_pct_2), id(fan_pct_3)};
+      bool fon = fs[p]->has_state() && fs[p]->state == "on";
+      float pct = (fp[p]->has_state() && !isnan(fp[p]->state)) ? fp[p]->state : 0;
+      const int FY = TY + 2 * (TH + G), FH = 92, FW = W - 2 * M;
+      card(M, FY, FW, FH, fon);
+      auto ffg = fon ? PAPER : INK;
+      it.print(M + 52, FY + FH / 2, id(mdi_l), ffg, TextAlign::CENTER, fon ? "\U000F0210" : "\U000F081D");
+      it.print(M + 100, FY + FH / 2 - 14, id(font_name), ffg, TextAlign::CENTER_LEFT, "Fan");
+      if (fon) it.printf(M + 100, FY + FH / 2 + 18, id(font_reg), ffg, TextAlign::CENTER_LEFT, "%.0f%%", pct);
+      else     it.print(M + 100, FY + FH / 2 + 18, id(font_reg), ffg, TextAlign::CENTER_LEFT, "Off");
+      // speed: 4 pills
+      const int BX0 = M + 200, BX1 = M + FW - 24, SG = 10, SW = (BX1 - BX0 - 3 * SG) / 4;
+      for (int i = 0; i < 4; i++) {
+        int bx = BX0 + i * (SW + SG), by = FY + FH / 2 - 9;
+        bool lit = fon && pct >= (i + 1) * 25 - 1;
+        rr(bx, by, SW, 18, 9, ffg);
+        if (!lit) rr(bx + 2, by + 2, SW - 4, 14, 7, fon ? INK : PAPER);
+      }
+
+      // ---- - / + buttons ----
+      const int BY = FY + FH + G, BH = H - M - BY;
+      card(M, BY, TW, BH, false);
+      card(M + TW + G, BY, TW, BH, false);
+      it.print(M + TW / 2, BY + BH / 2, id(mdi_l), INK, TextAlign::CENTER, "\U000F0374");
+      it.print(M + TW + G + TW / 2, BY + BH / 2, id(mdi_l), INK, TextAlign::CENTER, "\U000F0415");
+
+# =============================================================================
+# Battery: deep sleep, wake on pick-up (IMU, GPIO7) or OK button (GPIO4)
+# =============================================================================
+deep_sleep:
+  id: deep_sleep_1
+  esp32_ext1_wakeup:
+    pins:
+      - number: GPIO4
+        mode: INPUT_PULLUP
+        allow_other_uses: true
+      - number: GPIO7
+        allow_other_uses: true
+    mode: ANY_LOW
+
+interval:
+  # Redraw every 5 minutes for temperature / battery
+  - interval: 300s
+    then:
+      - script.execute: refresh_soon
+
+  # On battery, sleep after ${awake_seconds}s idle.
+  # Never sleeps while charging or when "Stay Awake" is on.
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return !id(going_to_sleep)
+                  && !id(stay_awake).state
+                  && !id(charging).state
+                  && (millis() - id(last_activity)) > ${awake_seconds} * 1000UL;
+          then:
+            - script.execute: go_sleep
